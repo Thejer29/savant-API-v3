@@ -3,7 +3,8 @@ import axios from 'axios';
 import { parse } from 'csv-parse/sync';
 
 // --- CONFIGURATION ---
-// CORRECT YEAR: 2025 (For the 2025-2026 Season)
+// CRITICAL: MoneyPuck uses the START YEAR for the URL. 
+// 2025-2026 Season = "2025"
 const SEASON_YEAR = "2025"; 
 
 const ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard";
@@ -64,6 +65,7 @@ const normalizeTeamCode = (input: string) => {
     "ANA": "ANA", "ANAHEIM DUCKS": "ANA",
     "SEA": "SEA", "SEATTLE KRAKEN": "SEA"
   };
+  
   return map[clean] || (clean.length === 3 ? clean : "UNK");
 };
 
@@ -125,8 +127,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (pAction === "schedule") {
       const targetDate = pDate ? pDate.replace(/-/g, "") : getHockeyDate();
       const url = `${ESPN_SCOREBOARD_URL}?dates=${targetDate}`;
-      const espnRes = await axios.get(url, axiosConfig);
       
+      const espnRes = await axios.get(url, axiosConfig);
       const games = (espnRes.data.events || []).map((evt: any) => {
         const c = evt.competitions[0];
         return {
@@ -141,7 +143,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // --- MODE B: GAME STATS ---
-    if (!pHome || !pAway) return res.status(400).json({ error: "Missing teams" });
+    if (!pHome || !pAway) return res.status(400).json({ error: "Missing home/away" });
 
     const targetHome = normalizeTeamCode(pHome);
     const targetAway = normalizeTeamCode(pAway);
@@ -164,6 +166,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // Extract Stats
     const getSavantStats = (code: string) => {
+      // Find Rows (MoneyPuck uses 'situation' column)
       const row5v5 = cachedTeamStats.find((r: any) => normalizeTeamCode(r.team) === code && r.situation === "5on5");
       const rowAll = cachedTeamStats.find((r: any) => normalizeTeamCode(r.team) === code && r.situation === "all");
       
@@ -188,6 +191,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           status = "Projected #1";
       }
 
+      const gTime = gRow ? (getFloat(gRow, ['iceTime', 'icetime']) || 1) : 1;
+
       return {
         name: code,
         gfPerGame: (getFloat(rowAll, ['goalsFor', 'GF']) / iceAll) * 3600,
@@ -199,17 +204,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         // Shotgun Column Names
         ppPercent: (getFloat(rowAll, ['ppGoalsFor', 'fiveOnFourGoalsFor']) / (getFloat(rowAll, ['penaltiesDrawn', 'penaltiesDrawnPer60']) || 1)) * 100,
         pkPercent: 100 - ((getFloat(rowAll, ['ppGoalsAgainst', 'fiveOnFourGoalsAgainst']) / (getFloat(rowAll, ['penaltiesTaken', 'penaltiesTakenPer60']) || 1)) * 100),
-        pimsPerGame: (getFloat(rowAll, ['penaltiesMinutes', 'pim']) / iceAll) * 3600,
+        pimsPerGame: (getFloat(rowAll, ['penaltiesMinutes', 'pim', 'penalityMinutes']) / iceAll) * 3600,
         
-        faceoffPercent: getFloat(rowAll, ['faceOffWinPercentage', 'faceOffsWonPercentage']) * 100,
+        faceoffPercent: getFloat(rowAll, ['faceOffWinPercentage', 'faceOffsWonPercentage', 'FOW%']) * 100,
         shootingPercent: getFloat(row5v5, ['shootingPercentage', 'shootingPercentage5on5']) * 100,
         corsiPercent: getFloat(row5v5, ['corsiPercentage', 'shotAttemptsPercentage']) * 100,
         
         goalie: {
            name: gRow?.name || "Avg Goalie",
-           gsax: gRow ? (getFloat(gRow, ['goalsSavedAboveExpected', 'xGoalsSaved']) / (getFloat(gRow, ['iceTime'])||1)) * 3600 : 0,
+           gsax: gRow ? (getFloat(gRow, ['goalsSavedAboveExpected', 'xGoalsSaved']) / gTime) * 3600 : 0,
            svPct: gRow ? getFloat(gRow, ['savePercentage', 'Save%']) : 0.900,
-           gaa: gRow ? (getFloat(gRow, ['goalsAgainst']) * 3600) / (getFloat(gRow, ['iceTime'])||1) : 3.0,
+           gaa: gRow ? (getFloat(gRow, ['goalsAgainst']) * 3600) / gTime : 3.0,
            status
         }
       };
@@ -222,6 +227,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
 
   } catch (e) {
-    return res.status(500).json({ error: String(e) });
+    return res.status(500).json({ error: "API Error", details: String(e) });
   }
-                                                                                       }
+        }                                                                              }

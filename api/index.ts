@@ -1,6 +1,5 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node';
-import axios from 'axios';
-import { parse } from 'csv-parse/sync';
+const axios = require('axios');
+const { parse } = require('csv-parse/sync');
 
 // --- DATA SOURCES ---
 const ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard";
@@ -9,35 +8,17 @@ const MONEYPUCK_GOALIES_URL = "https://moneypuck.com/moneypuck/playerData/season
 const NHL_SCHEDULE_URL = "https://api-web.nhle.com/v1/schedule/now";
 
 // --- CACHE ---
-// Vercel reuses instances, so this cache works for warm starts
-let cachedTeamStats: any = null;
-let cachedGoalieStats: any = null;
-let cachedEspnData: any = null;
-let cachedStarterData: any = null;
-
+let cachedTeamStats = null;
+let cachedGoalieStats = null;
+let cachedStarterData = null;
 let lastStatsFetch = 0;
-let lastOddsFetch = 0;
 let lastStarterFetch = 0;
-
 const STATS_CACHE = 1000 * 60 * 60; // 1 Hour
-const ODDS_CACHE = 1000 * 60 * 5;   // 5 Minutes
-const STARTER_CACHE = 1000 * 60 * 15; // 15 Minutes
 
-// --- HELPER: SAFE NUMBER PARSER ---
-const getFloat = (row: any, keys: string[]) => {
-  for (const key of keys) {
-    if (row[key] !== undefined && row[key] !== null && row[key] !== "") {
-      const val = parseFloat(row[key]);
-      if (!isNaN(val)) return val;
-    }
-  }
-  return 0;
-};
-
-// --- TEAM MAPPING HELPER ---
-const normalizeTeamCode = (input: string) => {
+// --- HELPER ---
+const normalizeTeamCode = (input) => {
   if (!input) return "UNK";
-  const map: Record<string, string> = {
+  const map = {
     "S.J": "SJS", "SJ": "SJS", "San Jose Sharks": "SJS",
     "T.B": "TBL", "TB": "TBL", "Tampa Bay Lightning": "TBL",
     "L.A": "LAK", "LA": "LAK", "Los Angeles Kings": "LAK",
@@ -71,25 +52,35 @@ const normalizeTeamCode = (input: string) => {
     "ANA": "ANA", "Anaheim Ducks": "ANA",
     "SEA": "SEA", "Seattle Kraken": "SEA"
   };
-  
-  // If input is already 3 chars, assume it's a code, otherwise standardize
-  if (input.length === 3 && !map[input]) return input.toUpperCase();
   return map[input] || input.substring(0, 3).toUpperCase();
 };
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // 1. PARSE QUERY PARAMS (Vercel style)
-  const { home, away, homeGoalie, awayGoalie, action, date } = req.query;
-  
-  // Helper to ensure string
-  const str = (v: string | string[] | undefined) => Array.isArray(v) ? v[0] : v || "";
-  
-  const pAction = str(action);
-  const pDate = str(date);
-  
-  const currentTime = Date.now();
+const getFloat = (row, keys) => {
+  for (const key of keys) {
+    if (row[key] !== undefined && row[key] !== null && row[key] !== "") {
+      const val = parseFloat(row[key]);
+      if (!isNaN(val)) return val;
+    }
+  }
+  return 0;
+};
 
-  // CONFIG: Spoof Browser
+module.exports = async (req, res) => {
+  // --- CORS HEADERS (CRITICAL FOR AI STUDIO) ---
+  res.setHeader('Access-Control-Allow-Origin', '*'); // Allow ANY site to call this
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  // Handle Preflight Request
+  if (req.method === 'OPTIONS') {
+    res.status(200).end();
+    return;
+  }
+
+  const { home, away, homeGoalie, awayGoalie, action, date } = req.query;
+  const currentTime = Date.now();
+  
+  // Headers to spoof browser
   const axiosConfig = {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -97,197 +88,142 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   };
 
-  // ==========================================
-  // MODE A: SCHEDULE
-  // ==========================================
-  if (pAction === "schedule") {
+  // --- 1. SCHEDULE MODE ---
+  if (action === "schedule") {
     try {
-      // Fix Date Format: 2025-11-28 -> 20251128
-      const cleanDate = pDate ? pDate.replace(/-/g, "") : "";
+      const cleanDate = date ? date.replace(/-/g, "") : "";
       const url = cleanDate ? `${ESPN_SCOREBOARD_URL}?dates=${cleanDate}` : ESPN_SCOREBOARD_URL;
-      
       const espnRes = await axios.get(url, axiosConfig);
-      const events = espnRes.data.events || [];
-
-      const games = events.map((evt: any) => {
+      
+      const games = (espnRes.data.events || []).map((evt) => {
         const competition = evt.competitions[0];
-        const homeComp = competition.competitors.find((c: any) => c.homeAway === 'home');
-        const awayComp = competition.competitors.find((c: any) => c.homeAway === 'away');
-        
+        const homeComp = competition.competitors.find((c) => c.homeAway === 'home');
+        const awayComp = competition.competitors.find((c) => c.homeAway === 'away');
         return {
           id: evt.id,
           date: evt.date,
-          status: evt.status.type.shortDetail, 
-          homeTeam: {
-            name: homeComp.team.displayName,
-            code: normalizeTeamCode(homeComp.team.abbreviation),
-            score: homeComp.score,
-            logo: homeComp.team.logo
-          },
-          awayTeam: {
-            name: awayComp.team.displayName,
-            code: normalizeTeamCode(awayComp.team.abbreviation),
-            score: awayComp.score,
-            logo: awayComp.team.logo
-          }
+          status: evt.status.type.shortDetail,
+          homeTeam: { name: homeComp.team.displayName, code: normalizeTeamCode(homeComp.team.abbreviation), score: homeComp.score },
+          awayTeam: { name: awayComp.team.displayName, code: normalizeTeamCode(awayComp.team.abbreviation), score: awayComp.score }
         };
       });
-
-      return res.status(200).json({ games, count: games.length, dateUsed: cleanDate });
-    } catch (error) {
-      return res.status(500).json({ error: "Schedule Fetch Failed", details: String(error) });
+      res.status(200).json({ games });
+      return;
+    } catch (e) {
+      res.status(500).json({ error: "Schedule Error", details: e.toString() });
+      return;
     }
   }
 
-  // ==========================================
-  // MODE B: GAME STATS
-  // ==========================================
+  // --- 2. STATS MODE ---
   if (!home || !away) {
-    return res.status(400).json({ error: "Missing 'home' or 'away' parameters." });
+    res.status(400).json({ error: "Missing home/away" });
+    return;
   }
 
-  const targetHome = normalizeTeamCode(str(home));
-  const targetAway = normalizeTeamCode(str(away));
-
   try {
-    // 1. FETCH MONEYPUCK STATS
+    // Fetch Stats (Cache)
     if (!cachedTeamStats || (currentTime - lastStatsFetch > STATS_CACHE)) {
-      console.log("Fetching MoneyPuck Stats...");
-      const [mpTeamsRes, mpGoaliesRes] = await Promise.all([
+      const [mpTeams, mpGoalies] = await Promise.all([
         axios.get(MONEYPUCK_TEAMS_URL, axiosConfig),
         axios.get(MONEYPUCK_GOALIES_URL, axiosConfig)
       ]);
-      cachedTeamStats = parse(mpTeamsRes.data, { columns: true, skip_empty_lines: true });
-      cachedGoalieStats = parse(mpGoaliesRes.data, { columns: true, skip_empty_lines: true });
+      cachedTeamStats = parse(mpTeams.data, { columns: true, skip_empty_lines: true });
+      cachedGoalieStats = parse(mpGoalies.data, { columns: true, skip_empty_lines: true });
       lastStatsFetch = currentTime;
     }
 
-    // 2. FETCH STARTERS (NHL)
-    if (!cachedStarterData || (currentTime - lastStarterFetch > STARTER_CACHE)) {
-      try {
-        const nhlRes = await axios.get(NHL_SCHEDULE_URL);
-        const todayGames = nhlRes.data.gameWeek?.[0]?.games || [];
-        cachedStarterData = {};
-        todayGames.forEach((game: any) => {
-           const mapGoalie = (g: any) => ({
-               name: `${g.firstName.default} ${g.lastName.default}`,
-               status: "Confirmed"
-           });
-           if(game.awayTeam.startingGoalie) cachedStarterData[normalizeTeamCode(game.awayTeam.abbrev)] = mapGoalie(game.awayTeam.startingGoalie);
-           if(game.homeTeam.startingGoalie) cachedStarterData[normalizeTeamCode(game.homeTeam.abbrev)] = mapGoalie(game.homeTeam.startingGoalie);
-        });
-        lastStarterFetch = currentTime;
-      } catch (e) { console.log("Starter fetch failed"); }
-    }
-
-    // 3. FETCH ODDS (ESPN)
-    let gameOdds = null;
-    if (!cachedEspnData || (currentTime - lastOddsFetch > ODDS_CACHE)) {
+    // Fetch Starters (Cache)
+    if (!cachedStarterData || (currentTime - lastStarterFetch > (1000 * 60 * 15))) {
        try {
-         // Use date if provided, else default
-         const cleanDate = pDate ? pDate.replace(/-/g, "") : "";
-         const url = cleanDate ? `${ESPN_SCOREBOARD_URL}?dates=${cleanDate}` : ESPN_SCOREBOARD_URL;
-         const espnRes = await axios.get(url, axiosConfig);
-         cachedEspnData = espnRes.data;
-         lastOddsFetch = currentTime;
-       } catch (e) { console.log("Odds fetch failed"); }
+         const nhlRes = await axios.get(NHL_SCHEDULE_URL);
+         cachedStarterData = {};
+         (nhlRes.data.gameWeek?.[0]?.games || []).forEach((game) => {
+             if(game.awayTeam.startingGoalie) cachedStarterData[normalizeTeamCode(game.awayTeam.abbrev)] = game.awayTeam.startingGoalie;
+             if(game.homeTeam.startingGoalie) cachedStarterData[normalizeTeamCode(game.homeTeam.abbrev)] = game.homeTeam.startingGoalie;
+         });
+         lastStarterFetch = currentTime;
+       } catch(e) {}
     }
 
-    // Match Odds Logic
-    if (cachedEspnData && cachedEspnData.events) {
-      const game = cachedEspnData.events.find((evt: any) => {
-        const competitors = evt.competitions[0].competitors;
-        const teamA = normalizeTeamCode(competitors[0].team.abbreviation);
-        const teamB = normalizeTeamCode(competitors[1].team.abbreviation);
-        return (teamA === targetHome && teamB === targetAway) || 
-               (teamA === targetAway && teamB === targetHome);
-      });
-      if (game) {
-        const comp = game.competitions?.[0];
-        const oddsObj = comp?.odds?.[0] || null;
-        if (oddsObj) {
-          gameOdds = {
-            source: "ESPN (Live)",
-            line: oddsObj.details || "N/A",
-            total: oddsObj.overUnder || 6.5
+    // Fetch Odds (Live)
+    let gameOdds = { source: "ESPN", line: "OFF", total: "6.5" };
+    try {
+       const cleanDate = date ? date.replace(/-/g, "") : "";
+       const url = cleanDate ? `${ESPN_SCOREBOARD_URL}?dates=${cleanDate}` : ESPN_SCOREBOARD_URL;
+       const espnRes = await axios.get(url, axiosConfig);
+       const game = espnRes.data.events?.find((evt) => {
+          const c = evt.competitions[0].competitors;
+          return (normalizeTeamCode(c[0].team.abbreviation) === normalizeTeamCode(home) && 
+                  normalizeTeamCode(c[1].team.abbreviation) === normalizeTeamCode(away)) ||
+                 (normalizeTeamCode(c[0].team.abbreviation) === normalizeTeamCode(away) && 
+                  normalizeTeamCode(c[1].team.abbreviation) === normalizeTeamCode(home));
+       });
+       if (game?.competitions?.[0]?.odds?.[0]) {
+          gameOdds = { 
+            source: "ESPN", 
+            line: game.competitions[0].odds[0].details, 
+            total: game.competitions[0].odds[0].overUnder 
           };
-        }
-      }
-    }
+       }
+    } catch(e) {}
 
-    // 4. EXTRACT STATS
-    const getSavantStats = (teamCode: string, requestedGoalie?: string) => {
-      const teamRow = cachedTeamStats.find((row: any) => normalizeTeamCode(row.team) === teamCode && row.situation === "5on5");
-      const teamAllRow = cachedTeamStats.find((row: any) => normalizeTeamCode(row.team) === teamCode && row.situation === "all");
+    // Extract
+    const getSavantStats = (code, reqGoalie) => {
+       const row = cachedTeamStats.find((r) => normalizeTeamCode(r.team) === code && r.situation === "5on5");
+       const allRow = cachedTeamStats.find((r) => normalizeTeamCode(r.team) === code && r.situation === "all");
+       if (!row) return null;
 
-      if (!teamRow) return null;
+       // Goalie
+       let gName = reqGoalie;
+       let status = "Unconfirmed";
+       if (!gName && cachedStarterData?.[code]) {
+          gName = `${cachedStarterData[code].firstName.default} ${cachedStarterData[code].lastName.default}`;
+          status = "Confirmed";
+       }
+       
+       const teamGoalies = cachedGoalieStats.filter(g => normalizeTeamCode(g.team) === code);
+       let gRow = gName ? teamGoalies.find(g => g.name.toLowerCase().includes(gName.toLowerCase().split(" ").pop())) : null;
+       
+       // Fallback to #1
+       if (!gRow && teamGoalies.length > 0) {
+          teamGoalies.sort((a,b) => getFloat(b, ['gamesPlayed']) - getFloat(a, ['gamesPlayed']));
+          gRow = teamGoalies[0];
+          status = "Projected #1";
+       }
 
-      // Goalie Logic
-      let targetGoalieName = requestedGoalie;
-      let starterStatus = "Unconfirmed";
+       const iceAll = getFloat(allRow, ['iceTime']) || 1;
+       const ice5v5 = getFloat(row, ['iceTime']) || 1;
 
-      if (!targetGoalieName && cachedStarterData && cachedStarterData[teamCode]) {
-          targetGoalieName = cachedStarterData[teamCode].name;
-          starterStatus = cachedStarterData[teamCode].status;
-      }
-
-      const teamGoalies = cachedGoalieStats.filter((g: any) => normalizeTeamCode(g.team) === teamCode);
-      let goalieRow = null;
-
-      if (targetGoalieName) {
-          goalieRow = teamGoalies.find((g: any) => g.name.toLowerCase().includes(targetGoalieName!.toLowerCase().split(" ").pop()!));
-      }
-
-      // Fallback: #1 Goalie by GP
-      if (!goalieRow && teamGoalies.length > 0) {
-          teamGoalies.sort((a: any, b: any) => getFloat(b, ['gamesPlayed']) - getFloat(a, ['gamesPlayed']));
-          goalieRow = teamGoalies[0];
-          starterStatus = "Projected #1";
-      }
-
-      let goalieStats = { gsax: 0, gaa: 0, svPct: 0.900, name: "Average Goalie" };
-      if (goalieRow) {
-          const gTime = getFloat(goalieRow, ['iceTime']) || 1;
-          goalieStats = {
-              name: goalieRow.name,
-              gsax: (getFloat(goalieRow, ['goalsSavedAboveExpected']) / gTime) * 3600,
-              gaa: (getFloat(goalieRow, ['goalsAgainst']) * 3600) / gTime,
-              svPct: getFloat(goalieRow, ['savePercentage'])
-          };
-      }
-
-      const iceTimeAll = getFloat(teamAllRow, ['iceTime']) || 1;
-      const iceTime5v5 = getFloat(teamRow, ['iceTime']) || 1;
-      
-      // HDCF% Calculation
-      const hdFor = getFloat(teamRow, ['highDangerShotsFor', 'highDangerGoalsFor', 'flurryAdjustedxGoalsFor']);
-      const hdAg = getFloat(teamRow, ['highDangerShotsAgainst', 'highDangerGoalsAgainst', 'flurryAdjustedxGoalsAgainst']);
-      const hdcf = (hdFor + hdAg) > 0 ? (hdFor / (hdFor + hdAg)) * 100 : 50;
-
-      return {
-        name: teamCode,
-        gfPerGame: (getFloat(teamAllRow, ['goalsFor']) / iceTimeAll) * 3600,
-        gaPerGame: (getFloat(teamAllRow, ['goalsAgainst']) / iceTimeAll) * 3600,
-        xgaPer60: (getFloat(teamRow, ['xGoalsAgainst']) / iceTime5v5) * 3600,
-        ppPercent: (getFloat(teamAllRow, ['ppGoalsFor']) / getFloat(teamAllRow, ['penaltiesDrawn'])) * 100 || 0,
-        pkPercent: 100 - ((getFloat(teamAllRow, ['ppGoalsAgainst']) / getFloat(teamAllRow, ['penaltiesTaken'])) * 100 || 0),
-        pimsPerGame: (getFloat(teamAllRow, ['penaltiesMinutes']) / (iceTimeAll / 3600)) || 8.0,
-        xgfPercent: getFloat(teamRow, ['xGoalsPercentage']) * 100,
-        hdcfPercent: hdcf,
-        shootingPercent: getFloat(teamRow, ['shootingPercentage']) * 100,
-        faceoffPercent: getFloat(teamAllRow, ['faceOffWinPercentage']) * 100,
-        corsiPercent: getFloat(teamRow, ['corsiPercentage']) * 100,
-        goalie: { ...goalieStats, status: starterStatus }
-      };
+       return {
+          name: code,
+          gfPerGame: (getFloat(allRow, ['goalsFor']) / iceAll) * 3600,
+          gaPerGame: (getFloat(allRow, ['goalsAgainst']) / iceAll) * 3600,
+          xgaPer60: (getFloat(row, ['xGoalsAgainst']) / ice5v5) * 3600,
+          xgfPercent: getFloat(row, ['xGoalsPercentage']) * 100,
+          hdcfPercent: (getFloat(row, ['highDangerShotsFor']) / (getFloat(row, ['highDangerShotsFor']) + getFloat(row, ['highDangerShotsAgainst']))) * 100 || 50,
+          ppPercent: (getFloat(allRow, ['ppGoalsFor']) / getFloat(allRow, ['penaltiesDrawn'])) * 100 || 0,
+          pkPercent: 100 - ((getFloat(allRow, ['ppGoalsAgainst']) / getFloat(allRow, ['penaltiesTaken'])) * 100 || 0),
+          pimsPerGame: (getFloat(allRow, ['penaltiesMinutes']) / iceAll) * 3600,
+          corsiPercent: getFloat(row, ['corsiPercentage']) * 100,
+          faceoffPercent: getFloat(allRow, ['faceOffWinPercentage']) * 100,
+          goalie: {
+             name: gRow?.name || "Unknown",
+             gsax: gRow ? (getFloat(gRow, ['goalsSavedAboveExpected']) / (getFloat(gRow, ['iceTime'])||1)) * 3600 : 0,
+             svPct: gRow ? getFloat(gRow, ['savePercentage']) : 0.900,
+             gaa: gRow ? (getFloat(gRow, ['goalsAgainst']) * 3600) / (getFloat(gRow, ['iceTime'])||1) : 3.0,
+             status
+          }
+       };
     };
 
-    return res.status(200).json({
-      home: getSavantStats(targetHome, str(homeGoalie)),
-      away: getSavantStats(targetAway, str(awayGoalie)),
-      odds: gameOdds || { source: "Not Found", line: "OFF", total: "6.5" }
+    res.status(200).json({
+      home: getSavantStats(normalizeTeamCode(home), homeGoalie),
+      away: getSavantStats(normalizeTeamCode(away), awayGoalie),
+      odds: gameOdds
     });
 
-  } catch (error) {
-    return res.status(500).json({ error: "Engine Error", details: String(error) });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
   }
-}
+};
